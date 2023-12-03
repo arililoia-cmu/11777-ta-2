@@ -28,6 +28,18 @@ from mtr.modules.tokenizer import ResFrontEnd, SpecPatchEmbed
 from mtr.modules.encoder import MusicTransformer
 from mtr.utils.train_utils import Logger, AverageMeter, ProgressMeter, EarlyStopping, save_hparams
 
+ca_config = {
+    "optimizer_params":{
+        'lr':1e-3, # this is max value
+        'weight_decay':1e-2,
+    },
+    "scheduler_params":{
+        "eta_min":0,
+        "last_epoch": -1,
+    },
+    "Tmax_num" : 4
+}
+
 def main():
     parser = get_parser()
     args = parser.parse_args()
@@ -178,7 +190,11 @@ def main_worker(ngpus_per_node, args):
     else:
         model = model.to(args.device)
     # optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), **ca_config['optimizer_params'])
+    scaler = torch.cuda.amp.GradScaler()
+    Tmax = len(train_loader)*ca_config['Tmax_num']
+    scheduler_real = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max= ca_config['Tmax_num']*len(train_loader), **ca_config['scheduler_params'])
+
     earlystopping_callback = EarlyStopping()
     cudnn.benchmark = True
 
@@ -198,7 +214,7 @@ def main_worker(ngpus_per_node, args):
             val_sampler.set_epoch(epoch)
         
         # train for one epoch
-        train(train_loader, model, optimizer, epoch, logger, args)
+        train(train_loader, model, optimizer, epoch, logger, args, scaler, scheduler_real)
         val_loss, audio_accs, text_accs = validate(val_loader, model, epoch, args)
         
         if args.log:
@@ -232,13 +248,17 @@ def main_worker(ngpus_per_node, args):
         #     print("We are at epoch:", epoch)
         #     break
 
-def train(train_loader, model, optimizer, epoch, logger, args):
+def train(train_loader, model, optimizer, epoch, logger, args, scaler, scheduler_real):
     # train_losses = AverageMeter('Train Loss', ':.4e')
     # progress = ProgressMeter(len(train_loader),[train_losses],prefix="Epoch: [{}]".format(epoch))
     iters_per_epoch = len(train_loader)
     model.train()
     for data_iter_step, batch in enumerate(tqdm(train_loader)):
-        lr = adjust_learning_rate(optimizer, (data_iter_step + 1) / iters_per_epoch + epoch, args)
+        
+        optimizer.zero_grad()
+        
+        # lr = adjust_learning_rate(optimizer, (data_iter_step + 1) / iters_per_epoch + epoch, args)
+        lr = float(optimizer.param_groups[0]['lr'])
         audio = batch['audio']
         text = batch['text']
         text_mask = batch['text_mask']
@@ -261,9 +281,20 @@ def train(train_loader, model, optimizer, epoch, logger, args):
             # logger.log_learning_rate(lr, epoch * iters_per_epoch + data_iter_step)
             wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/logit_scale": logit_scale.item()})
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if (((epoch % ca_config['Tmax_num']) == 0) and (epoch != 0)):
+            print("change optimizer")
+            del optimizer
+            del scheduler_real
+            optimizer = torch.optim.AdamW(model.parameters(), **ca_config['optimizer_params'])
+            scheduler_real = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ca_config['Tmax_num']*len(train_loader), **config['scheduler_params'])
+
+        # loss.backward()
+        # optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update() 
+
+        scheduler_real.step()
         
         # if data_iter_step % args.print_freq == 0:
         #     progress.display(data_iter_step)

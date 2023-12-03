@@ -37,7 +37,7 @@ disentangle: ''
 freeze: false
 subset: true
 log: true
-dropout: 0.2
+dropout: 0.3
 test: query
 n_proj: 1
 name: null
